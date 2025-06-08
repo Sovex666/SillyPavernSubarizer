@@ -145,6 +145,7 @@ const default_settings = {
     display_memories: true,  // display memories in the chat below each message
     default_chat_enabled: true,  // whether memory is enabled by default for new chats
     use_global_toggle_state: false,  // whether the on/off state for this profile uses the global state
+    api_keys_list: "", // Newline-separated list of API keys (actually profile names)
 };
 const global_settings = {
     profiles: {},  // dict of profiles by name
@@ -542,6 +543,14 @@ function set_settings(key, value) {
 function get_settings(key) {
     // Get a setting for the extension, or the default value if not set
     return extension_settings[MODULE_NAME]?.[key] ?? default_settings[key];
+}
+function get_api_keys() {
+    // Retrieve API keys from the textarea, split by newline, and trim whitespace.
+    const keysText = $('#api_keys_input').val();
+    if (!keysText) {
+        return [];
+    }
+    return keysText.split('\n').map(key => key.trim()).filter(key => key.length > 0);
 }
 function get_settings_element(key) {
     return settings_ui_map[key]?.[0]
@@ -1786,7 +1795,8 @@ class MemoryEditInterface {
         })
         this.$content.find(`#bulk_summarize`).on('click', async () => {
             let indexes = Array.from(this.selected).sort()  // summarize in ID order
-            await summarize_messages(indexes);
+            const api_keys_to_use = get_api_keys();
+            await summarize_messages(indexes, true, api_keys_to_use);
             this.update_table()
         })
         this.$content.find(`#bulk_delete`).on('click', () => {
@@ -1829,7 +1839,8 @@ class MemoryEditInterface {
         })
         this.$content.on("click", `tr .${summarize_button_class}`, async function () {
             let message_id = Number($(this).closest('tr').attr('message_id'));  // get the message ID from the row's "message_id" attribute
-            await summarize_messages(message_id);
+            const api_keys_to_use = get_api_keys();
+            await summarize_messages(message_id, false, api_keys_to_use);
         });
     }
 
@@ -2580,19 +2591,20 @@ globalThis.memory_intercept_messages = function (chat, _contextSize, _abort, typ
 
 
 // Summarization
-async function summarize_messages(indexes=null, show_progress=true) {
+async function summarize_messages(indexes = null, show_progress = true, api_keys = []) {
     // Summarize the given list of message indexes (or a single index)
+    // api_keys is an array of connection profile names to be used in round-robin.
     let ctx = getContext();
 
-    if (indexes === null) {  // default to the mose recent message, min 0
-        indexes = [Math.max(chat.length - 1, 0)]
+    if (indexes === null) {  // default to the most recent message, min 0
+        indexes = [Math.max(ctx.chat.length - 1, 0)]
     }
     indexes = Array.isArray(indexes) ? indexes : [indexes]  // cast to array if only one given
     if (!indexes.length) return;
 
-    debug(`Summarizing ${indexes.length} messages`)
+    debug(`Summarizing ${indexes.length} messages. API keys provided: ${api_keys.length}`)
 
-     // only show progress if there's more than one message to summarize
+    // only show progress if there's more than one message to summarize
     show_progress = show_progress && indexes.length > 1;
 
     // set stop flag to false just in case
@@ -2603,55 +2615,145 @@ async function summarize_messages(indexes=null, show_progress=true) {
         ctx.deactivateSendButtons();
     }
 
-    // Save the current completion preset (must happen before you set the connection profile because it changes the preset)
-    let summary_preset = get_settings('completion_preset');
-    let current_preset = await get_current_preset();
+    const initial_connection_profile = await get_current_connection_profile();
+    const initial_preset = await get_current_preset();
+    const using_multiple_api_keys = Array.isArray(api_keys) && api_keys.length > 0;
 
-    // Get the current connection profile
-    let summary_profile = get_settings('connection_profile');
-    let current_profile = await get_current_connection_profile()
+    // Helper function to clear memory fields in case of pre-summary errors
+    function clear_memory_on_profile_error(message) {
+        set_data(message, "memory", null);
+        set_data(message, "prefill", null);
+        set_data(message, "reasoning", null);
+        set_data(message, "edited", false);
+        // 'hash' can be left as is. 'error' will be set by the caller.
+    }
 
-    // set the completion preset and connection profile for summarization (preset must be set after connection profile)
-    await set_connection_profile(summary_profile);
-    await set_preset(summary_preset);
+    if (!using_multiple_api_keys) {
+        // Original behavior: use profile/preset from settings for the whole batch
+        const settings_connection_profile = get_settings('connection_profile');
+        const settings_preset = get_settings('completion_preset');
 
-    let n = 0;
-    for (let i of indexes) {
-        if (show_progress) progress_bar('summarize', n+1, indexes.length, "Summarizing");
+        if (!await verify_connection_profile(settings_connection_profile)) {
+            error(`Initial batch profile "${settings_connection_profile}" from settings is invalid. Aborting all summarizations.`);
+            // Restore original profile/preset before exiting, if they were changed.
+            if (await get_current_connection_profile() !== initial_connection_profile) {
+                await set_connection_profile(initial_connection_profile);
+            }
+            if (await get_current_preset() !== initial_preset) {
+                await set_preset(initial_preset);
+            }
+            if (get_settings('block_chat')) { // Deactivate send buttons if they were active
+                ctx.activateSendButtons();
+            }
+            if (show_progress) { // Remove progress bar if it was shown
+                remove_progress_bar('summarize');
+            }
+            // Mark all messages in this batch with an error
+            for (const i of indexes) {
+                set_data(ctx.chat[i], 'error', `Batch summarization aborted due to invalid profile: ${settings_connection_profile}`);
+                clear_memory_on_profile_error(ctx.chat[i]);
+                update_message_visuals(i, false);
+                if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(i, null, false);
+            }
+            refresh_memory(); // To update UI with errors
+            return; // Exit the function
+        }
 
-        // check if summarization was stopped by the user
+        if (settings_connection_profile !== initial_connection_profile) {
+            await set_connection_profile(settings_connection_profile);
+        }
+        if (settings_preset !== initial_preset) {
+            await set_preset(settings_preset);
+        }
+    }
+    // If using_multiple_api_keys, profile/preset will be set per message inside the loop.
+
+    let rotation_idx = 0; // Index for API key rotation
+    let successfully_summarized_count = 0;
+
+    for (const i of indexes) { // i is the message index from the input array
+        if (show_progress) progress_bar('summarize', successfully_summarized_count + 1, indexes.length, "Summarizing");
+
         if (STOP_SUMMARIZATION) {
             log('Summarization stopped');
             break;
         }
 
-        await summarize_message(i);
+        let current_profile_name_for_message = null;
+        if (using_multiple_api_keys) {
+            current_profile_name_for_message = api_keys[rotation_idx % api_keys.length];
+            debug(`Using profile ${current_profile_name_for_message} for message index ${i} (API key rotation)`);
 
-        // wait for time delay if set
-        let time_delay = get_settings('summarization_time_delay')
-        if (time_delay > 0 && n < indexes.length-1) {  // delay all except the last
-
-            // check if summarization was stopped by the user during summarization
-            if (STOP_SUMMARIZATION) {
-                log('Summarization stopped');
-                break;
+            const is_profile_valid = await verify_connection_profile(current_profile_name_for_message);
+            if (!is_profile_valid) {
+                const err_msg = `Invalid API Key Profile: ${current_profile_name_for_message}`;
+                error(`${err_msg} for message index ${i}`);
+                set_data(ctx.chat[i], 'error', err_msg);
+                clear_memory_on_profile_error(ctx.chat[i]);
+                update_message_visuals(i, false);
+                if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(i, null, false);
+                rotation_idx++;
+                continue; // Skip to next message
             }
-
-            debug(`Delaying generation by ${time_delay} seconds`)
-            if (show_progress) progress_bar('summarize', null, null, "Delaying")
-            await new Promise((resolve) => {
-                SUMMARIZATION_DELAY_TIMEOUT = setTimeout(resolve, time_delay * 1000)
-                SUMMARIZATION_DELAY_RESOLVE = resolve  // store the resolve function to call when cleared
-            });
+            try {
+                await set_connection_profile(current_profile_name_for_message);
+                await set_preset(get_settings('completion_preset')); // Assuming global preset for all
+            } catch (e) {
+                const err_msg = `Failed to set profile ${current_profile_name_for_message}`;
+                error(`${err_msg} for message index ${i}: ${e}`);
+                set_data(ctx.chat[i], 'error', err_msg);
+                clear_memory_on_profile_error(ctx.chat[i]);
+                update_message_visuals(i, false);
+                if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(i, null, false);
+                rotation_idx++;
+                continue; // Skip to next message
+            }
+        } else {
+            // Profile for single-use case already set before loop
+            current_profile_name_for_message = await get_current_connection_profile();
         }
 
-        n += 1;
+        // summarize_message catches its internal errors and uses set_data to store error info.
+        await summarize_message(i);
+
+        const message_error = get_data(ctx.chat[i], 'error');
+        if (message_error) {
+            // Avoid double logging if error was due to invalid profile handled above
+            if (!message_error.startsWith("Invalid API Key Profile:") && !message_error.startsWith("Failed to set profile")) {
+                error(`Summarization for message index ${i} failed using profile ${current_profile_name_for_message}. Error: ${message_error}`);
+            }
+        } else {
+            successfully_summarized_count++;
+        }
+
+        if (using_multiple_api_keys) {
+            rotation_idx++;
+        }
+
+        // wait for time delay if set
+        let time_delay = get_settings('summarization_time_delay');
+        // Delay only if not the last message in the current batch and more than one message to process overall.
+        if (time_delay > 0 && (indexes.indexOf(i) < indexes.length - 1)) {
+            if (STOP_SUMMARIZATION) {
+                log('Summarization stopped during delay');
+                break;
+            }
+            debug(`Delaying generation by ${time_delay} seconds`);
+            if (show_progress) progress_bar('summarize', null, null, "Delaying");
+            await new Promise((resolve) => {
+                SUMMARIZATION_DELAY_TIMEOUT = setTimeout(resolve, time_delay * 1000);
+                SUMMARIZATION_DELAY_RESOLVE = resolve;
+            });
+        }
     }
 
-
-    // restore the completion preset and connection profile
-    await set_connection_profile(current_profile);
-    await set_preset(current_preset);
+    // Restore initial connection profile and preset
+    if (await get_current_connection_profile() !== initial_connection_profile) {
+        await set_connection_profile(initial_connection_profile);
+    }
+    if (await get_current_preset() !== initial_preset) {
+        await set_preset(initial_preset);
+    }
 
     // remove the progress bar
     if (show_progress) remove_progress_bar('summarize')
@@ -2659,7 +2761,7 @@ async function summarize_messages(indexes=null, show_progress=true) {
     if (STOP_SUMMARIZATION) {  // check if summarization was stopped
         STOP_SUMMARIZATION = false  // reset the flag
     } else {
-        debug(`Messages summarized: ${indexes.length}`)
+        debug(`Messages summarized: ${n}`) // n is the count of successfully processed messages
     }
 
     if (get_settings('block_chat')) {
@@ -2669,7 +2771,9 @@ async function summarize_messages(indexes=null, show_progress=true) {
     refresh_memory()
 
     // Update the memory state interface if it's open
-    memoryEditInterface.update_table()
+    if (memoryEditInterface?.is_open()) { // Check if interface exists and is open
+        memoryEditInterface.update_table();
+    }
 }
 async function summarize_message(index) {
     // Summarize a message given the chat index, replacing any existing memories
@@ -3079,7 +3183,8 @@ async function auto_summarize_chat() {
     }
 
     let show_progress = get_settings('auto_summarize_progress');
-    await summarize_messages(messages_to_summarize, show_progress);
+    const api_keys_to_use = get_api_keys();
+    await summarize_messages(messages_to_summarize, show_progress, api_keys_to_use);
 }
 
 // Event handling
@@ -3142,7 +3247,8 @@ async function on_chat_event(event=null, data=null) {
                 if (!check_message_exclusion(message)) break;  // if the message is excluded, skip
                 if (!get_previous_swipe_memory(message, 'memory')) break;  // if the previous swipe doesn't have a memory, skip
                 debug("re-summarizing on swipe")
-                await summarize_messages(index);  // summarize the swiped message
+                const api_keys_for_swipe = get_api_keys();
+                await summarize_messages(index, false, api_keys_for_swipe);  // summarize the swiped message
                 refresh_memory()
                 break;
             } else { // not a swipe
@@ -3161,10 +3267,11 @@ async function on_chat_event(event=null, data=null) {
             if (!check_message_exclusion(context.chat[index])) break;  // if the message is excluded, skip
             if (!get_data(context.chat[index], 'memory')) break;  // if the message doesn't have a memory, skip
             debug("Message with memory edited, summarizing")
-            summarize_messages(index);  // summarize that message (no await so the message edit goes through)
+            const api_keys_for_edit = get_api_keys();
+            await summarize_messages(index, false, api_keys_for_edit);  // summarize that message
 
-            // TODO: I'd like to be able to refresh the memory here, but we can't await the summarization because
-            //  then the message edit textbox doesn't close until the summary is done.
+            // Refresh memory after summarization completes
+            refresh_memory();
 
             break;
 
@@ -3325,6 +3432,8 @@ Available Macros:
     bind_setting('#default_chat_enabled', 'default_chat_enabled', 'boolean');
     bind_setting('#use_global_toggle_state', 'use_global_toggle_state', 'boolean');
 
+    bind_setting('#api_keys_input', 'api_keys_list', 'text');
+
     // trigger the change event once to update the display at start
     $('#long_term_context_limit').trigger('change');
     $('#short_term_context_limit').trigger('change');
@@ -3361,7 +3470,8 @@ function initialize_message_buttons() {
     $chat.on("click", `.${summarize_button_class}`, async function () {
         const message_block = $(this).closest(".mes");
         const message_id = Number(message_block.attr("mesid"));
-        await summarize_messages(message_id);  // summarize the message
+        const api_keys_to_use = get_api_keys();
+        await summarize_messages(message_id, false, api_keys_to_use);  // summarize the message
     });
     $chat.on("click", `.${edit_button_class}`, async function () {
         const message_block = $(this).closest(".mes");
@@ -3559,8 +3669,9 @@ function initialize_slash_commands() {
         name: 'summarize_chat',
         helpString: 'Summarize the chat using the auto-summarization criteria, even if auto-summarization is off.',
         callback: async (args, limit) => {
-            let indexes = collect_messages_to_auto_summarize()
-            await summarize_messages(indexes);
+            let indexes = collect_messages_to_auto_summarize();
+            const api_keys_to_use = get_api_keys();
+            await summarize_messages(indexes, true, api_keys_to_use);
         },
     }));
 
@@ -3568,7 +3679,8 @@ function initialize_slash_commands() {
         name: 'summarize',
         callback: async (args, index) => {
             if (index === "") index = null  // if not provided the index is an empty string, but we need it to be null to get the default behavior
-            await summarize_messages(index);  // summarize the message
+            const api_keys_to_use = get_api_keys();
+            await summarize_messages(index, false, api_keys_to_use);  // summarize the message
             refresh_memory();
         },
         helpString: 'Summarize the given message index (defaults to most recent applicable message)',
