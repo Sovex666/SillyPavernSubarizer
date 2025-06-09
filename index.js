@@ -3028,77 +3028,8 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
         debug(`Successfully summarized messages: ${successfully_summarized_count} out of ${indexes.length} attempted.`);
     }
 
-    if (get_settings('block_chat')) {
-                error(`${err_msg} for message index ${i}`);
-                set_data(ctx.chat[i], 'error', err_msg);
-                clear_memory_on_profile_error(ctx.chat[i]);
-                update_message_visuals(i, false);
-                if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(i, null, false);
-                rotation_idx++;
-                continue; // Skip to next message
-            }
-            try {
-                await set_connection_profile(current_profile_name_for_message);
-                await set_preset(get_settings('completion_preset')); // Assuming global preset for all
-            } catch (e) {
-                const err_msg = `Failed to set profile ${current_profile_name_for_message}`;
-                error(`${err_msg} for message index ${i}: ${e}`);
-                set_data(ctx.chat[i], 'error', err_msg);
-                clear_memory_on_profile_error(ctx.chat[i]);
-                update_message_visuals(i, false);
-                if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(i, null, false);
-                rotation_idx++;
-                continue; // Skip to next message
-            }
-        } else {
-            // Profile for single-use case already set before loop
-            current_profile_name_for_message = await get_current_connection_profile();
-        }
-
-        // summarize_message catches its internal errors and uses set_data to store error info.
-        await summarize_message(i);
-
-        const message_error = get_data(ctx.chat[i], 'error');
-        if (message_error) {
-            // Avoid double logging if error was due to invalid profile handled above
-            if (!message_error.startsWith("Invalid API Key Profile:") && !message_error.startsWith("Failed to set profile")) {
-                error(`Summarization for message index ${i} failed using profile ${current_profile_name_for_message}. Error: ${message_error}`);
-            }
-        } else {
-            successfully_summarized_count++;
-        }
-
-        if (using_multiple_api_keys) {
-            rotation_idx++;
-        }
-
-        // wait for time delay if set
-        let time_delay = get_settings('summarization_time_delay');
-        // Delay only if not the last message in the current batch and more than one message to process overall.
-        if (time_delay > 0 && (indexes.indexOf(i) < indexes.length - 1)) {
-            if (STOP_SUMMARIZATION) {
-                log('Summarization stopped during delay');
-                break;
-            }
-            debug(`Delaying generation by ${time_delay} seconds`);
-            if (show_progress) progress_bar('summarize', null, null, "Delaying");
-            await new Promise((resolve) => {
-                SUMMARIZATION_DELAY_TIMEOUT = setTimeout(resolve, time_delay * 1000);
-                SUMMARIZATION_DELAY_RESOLVE = resolve;
-            });
-        }
-    }
-
-    // Restore initial connection profile and preset
-    if (await get_current_connection_profile() !== initial_connection_profile) {
-        await set_connection_profile(initial_connection_profile);
-    }
-    if (await get_current_preset() !== initial_preset) {
-        await set_preset(initial_preset);
-    }
-
     // remove the progress bar
-    if (show_progress) remove_progress_bar('summarize')
+    if (show_progress) remove_progress_bar('summarize');
 
     if (STOP_SUMMARIZATION) {  // check if summarization was stopped
         STOP_SUMMARIZATION = false  // reset the flag
