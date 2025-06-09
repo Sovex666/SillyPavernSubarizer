@@ -2598,7 +2598,7 @@ async function summarize_with_google_api(text_to_summarize, raw_google_api_key, 
     debug("summarize_with_google_api called.");
 
     // 1. Get model name from SillyTavern's current connection profile
-    let model_name = "gemini-1.5-flash"; // Default fallback
+    let model_name = "gemini-2.5-flash-preview-05-20"; // Default fallback
     
     try {
         // Get the current connection profile data
