@@ -2754,11 +2754,19 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
     // If raw_api_keys_list_param is empty, it falls back to using ST connection profiles (from api_keys_as_profiles_param).
     let ctx = getContext();
 
-    // Parameter renaming for clarity in this refactor:
-    // api_keys (old name) is now effectively raw_api_keys_list_param if direct, or api_keys_as_profiles_param if profile rotation.
-    // For this refactor, we assume `api_keys` parameter holds RAW keys for direct Google API.
-    // The fallback will use the settings-based profile rotation if `api_keys` is empty.
-    const raw_api_keys_list_param = api_keys; // Renaming for clarity within this function's scope.
+    // The `api_keys` parameter is expected to be an array of raw Google API key strings.
+    // If it's not provided/empty (e.g. from callers like slash commands which don't pass it),
+    // this function will fetch them using get_api_keys().
+    let ctx = getContext();
+
+    let actual_raw_keys_to_use;
+    if (api_keys && Array.isArray(api_keys) && api_keys.length > 0) {
+        actual_raw_keys_to_use = api_keys;
+        debug("summarize_messages: Using API keys passed as parameter.");
+    } else {
+        actual_raw_keys_to_use = get_api_keys();
+        debug("summarize_messages: API keys parameter was empty or not provided, fetched from UI settings via get_api_keys().");
+    }
 
     if (indexes === null) {  // default to the most recent message, min 0
         indexes = [Math.max(ctx.chat.length - 1, 0)];
@@ -2766,7 +2774,8 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
     indexes = Array.isArray(indexes) ? indexes : [indexes]  // cast to array if only one given
     if (!indexes.length) return;
 
-    debug(`Summarizing ${indexes.length} messages. Raw Google API Keys provided: ${raw_api_keys_list_param.length}`);
+    const use_direct_google_api = Array.isArray(actual_raw_keys_to_use) && actual_raw_keys_to_use.length > 0;
+    debug(`Summarizing ${indexes.length} messages. Using direct Google API: ${use_direct_google_api}. Keys available: ${actual_raw_keys_to_use.length}`);
 
     // only show progress if there's more than one message to summarize
     show_progress = show_progress && indexes.length > 1;
@@ -2784,7 +2793,7 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
 
     try {
         const base_profile_name_from_settings = get_settings('connection_profile');
-    const use_direct_google_api = Array.isArray(raw_api_keys_list_param) && raw_api_keys_list_param.length > 0;
+    // const use_direct_google_api = Array.isArray(raw_api_keys_list_param) && raw_api_keys_list_param.length > 0; // Definition moved up
 
     let instructions_from_base_profile = "";
     let generation_params_from_base_profile = {};
@@ -2872,7 +2881,7 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
 
     if (use_direct_google_api) {
         debug("Using direct Google API calls with raw keys.");
-        const MAX_CONCURRENT_CALLS = Math.min(raw_api_keys_list_param.length, 3); // Limit concurrency
+        const MAX_CONCURRENT_CALLS = Math.min(actual_raw_keys_to_use.length, 3); // Use actual_raw_keys_to_use
         let promises = [];
         let current_raw_key_idx = 0;
 
@@ -2884,7 +2893,7 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
             if (show_progress) progress_bar('summarize', successfully_summarized_count + 1, indexes.length, "Summarizing (Direct API)");
 
             const text_to_summarize = ctx.chat[message_idx].mes;
-            const raw_google_api_key_to_use = raw_api_keys_list_param[current_raw_key_idx % raw_api_keys_list_param.length];
+            const raw_google_api_key_to_use = actual_raw_keys_to_use[current_raw_key_idx % actual_raw_keys_to_use.length]; // Use actual_raw_keys_to_use
             current_raw_key_idx++;
 
             // Update UI to "Summarizing..." before pushing promise
