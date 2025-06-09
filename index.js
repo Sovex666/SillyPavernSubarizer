@@ -2757,7 +2757,6 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
     // The `api_keys` parameter is expected to be an array of raw Google API key strings.
     // If it's not provided/empty (e.g. from callers like slash commands which don't pass it),
     // this function will fetch them using get_api_keys().
-    let ctx = getContext();
 
     let actual_raw_keys_to_use;
     if (api_keys && Array.isArray(api_keys) && api_keys.length > 0) {
