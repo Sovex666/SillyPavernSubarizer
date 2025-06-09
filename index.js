@@ -2597,8 +2597,49 @@ globalThis.memory_intercept_messages = function (chat, _contextSize, _abort, typ
 async function summarize_with_google_api(text_to_summarize, raw_google_api_key, instructions_from_base_profile, generation_params = {}) {
     debug("summarize_with_google_api called.");
 
-    // 1. Construct API Endpoint URL
-    const model_name = "gemini-pro"; // Hardcoded for now
+    // 1. Get model name from SillyTavern's current connection profile
+    let model_name = "gemini-1.5-flash"; // Default fallback
+    
+    try {
+        // Get the current connection profile data
+        let current_profile = await get_current_connection_profile();
+        if (current_profile) {
+            let ctx = getContext();
+            let result = await ctx.executeSlashCommandsWithOptions(`/profile-get ${current_profile}`);
+            
+            if (result.pipe) {
+                let profile_data = JSON.parse(result.pipe);
+                debug(`Connection profile data keys: ${Object.keys(profile_data).join(', ')}`);
+                if (get_settings('debug_mode')) {
+                    debug(`Full connection profile data:`, profile_data);
+                }
+                
+                // Check various possible model field names in the profile
+                if (profile_data.model) {
+                    model_name = profile_data.model;
+                    debug(`Using model from connection profile 'model' field: ${model_name}`);
+                } else if (profile_data.openai_model) {
+                    model_name = profile_data.openai_model;
+                    debug(`Using model from connection profile 'openai_model' field: ${model_name}`);
+                } else if (profile_data.google_model) {
+                    model_name = profile_data.google_model;
+                    debug(`Using model from connection profile 'google_model' field: ${model_name}`);
+                } else if (profile_data.googleai_model) {
+                    model_name = profile_data.googleai_model;
+                    debug(`Using model from connection profile 'googleai_model' field: ${model_name}`);
+                } else {
+                    debug(`No model field found in connection profile. Available fields: ${Object.keys(profile_data).join(', ')}`);
+                    debug(`Using default model: ${model_name}`);
+                }
+            }
+        } else {
+            debug(`No current connection profile found, using default model: ${model_name}`);
+        }
+    } catch (error) {
+        debug(`Error getting model from connection profile: ${error.message}. Using default: ${model_name}`);
+    }
+    
+    // Construct API Endpoint URL
     const api_url = `https://generativelanguage.googleapis.com/v1beta/models/${model_name}:generateContent?key=${raw_google_api_key}`;
     // For security, avoid logging the full URL with the key in production.
     // The debug log will only show the key if debug_mode is on and the log function doesn't redact it.
