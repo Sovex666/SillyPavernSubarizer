@@ -2669,17 +2669,33 @@ async function summarize_with_google_api(text_to_summarize, raw_google_api_key, 
         if (!response.ok) {
             let error_detail = response.statusText;
             let error_code = response.status;
-            try {
-                const error_data = await response.json();
-                error_detail = error_data?.error?.message || JSON.stringify(error_data?.error); // Gemini often has error.message
-                if(error_data?.error?.code) error_code = error_data.error.code;
-                if (get_settings('debug_mode')) {
-                     debug("Google API Error Data: " + JSON.stringify(error_data));
+            const contentType = response.headers.get('content-type');
+
+            if (contentType && contentType.includes('application/json')) {
+                try {
+                    const error_data = await response.json();
+                    error_detail = error_data?.error?.message || JSON.stringify(error_data?.error); // Gemini often has error.message
+                    if(error_data?.error?.code) error_code = error_data.error.code; // Use code from JSON if available
+                    if (get_settings('debug_mode')) {
+                         debug("Google API Error Data (JSON): " + JSON.stringify(error_data));
+                    }
+                } catch (e) {
+                    // If parsing error JSON fails, stick with statusText
+                    if (get_settings('debug_mode')) {
+                        debug("Could not parse JSON error from Google API response despite application/json content type: " + e.message);
+                    }
+                    // error_detail remains response.statusText
                 }
-            } catch (e) {
-                // If parsing error JSON fails, stick with statusText
+            } else {
+                // Response is not JSON (e.g., HTML error page)
+                error_detail = `Response was not JSON. Full response logged for debugging if debug_mode is on. Status: ${response.status}`;
                 if (get_settings('debug_mode')) {
-                    debug("Could not parse JSON error from Google API response: " + e.message);
+                    try {
+                        const textResponse = await response.text();
+                        debug("Google API Error Data (Non-JSON): " + textResponse.substring(0, 500)); // Log first 500 chars
+                    } catch (textErr) {
+                        debug("Could not get text from non-JSON error response: " + textErr.message);
+                    }
                 }
             }
             const error_message = `Google API Error: ${error_code} - ${error_detail}`;
@@ -2687,6 +2703,7 @@ async function summarize_with_google_api(text_to_summarize, raw_google_api_key, 
             return { success: false, error: error_message };
         }
 
+        // Assuming response.ok is true, so expecting JSON.
         const data = await response.json();
         if (get_settings('debug_mode')) {
             debug("Google API Response Data (first 300 chars): " + JSON.stringify(data).substring(0, 300) + "...");
