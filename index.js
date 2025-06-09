@@ -2833,7 +2833,7 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
         // 'hash' can be left as is. 'error' will be set by the caller.
     }
 
-    if (!using_multiple_api_keys) {
+    if (!use_direct_google_api) {
         // Original behavior: use profile/preset from settings for the whole batch
         const settings_connection_profile = get_settings('connection_profile');
         const settings_preset = get_settings('completion_preset');
