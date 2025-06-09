@@ -85,6 +85,7 @@ Following is the message to summarize:
 const default_long_template = `[Following is a list of events that occurred in the past]:\n{{${generic_memories_macro}}}\n`
 const default_short_template = `[Following is a list of recent events]:\n{{${generic_memories_macro}}}\n`
 const default_settings = {
+    api_keys_list: [], // Newline-separated list of API keys (actually profile names) - STORED AS ARRAY
     // inclusion criteria
     message_length_threshold: 10,  // minimum message token length for summarization
     include_user_messages: false,  // include user messages in summarization
@@ -145,7 +146,7 @@ const default_settings = {
     display_memories: true,  // display memories in the chat below each message
     default_chat_enabled: true,  // whether memory is enabled by default for new chats
     use_global_toggle_state: false,  // whether the on/off state for this profile uses the global state
-    api_keys_list: "", // Newline-separated list of API keys (actually profile names)
+    // api_keys_list: "", // Newline-separated list of API keys (actually profile names) // MOVED AND CHANGED TO ARRAY
 };
 const global_settings = {
     profiles: {},  // dict of profiles by name
@@ -761,7 +762,11 @@ function set_setting_ui_element(key, element, type) {
 
     // get the setting value
     let setting_value = get_settings(key);
-    if (type === "text") {
+
+    if (key === 'api_keys_list') {
+        // Ensure it's an array and join to string for textarea
+        setting_value = Array.isArray(setting_value) ? setting_value.join('\n') : "";
+    } else if (type === "text") {
         setting_value = escape_string(setting_value)  // escape values like "\n"
     }
 
@@ -2589,20 +2594,162 @@ globalThis.memory_intercept_messages = function (chat, _contextSize, _abort, typ
     }
 };
 
+async function summarize_with_google_api(text_to_summarize, raw_google_api_key, instructions_from_base_profile, generation_params = {}) {
+    debug("summarize_with_google_api called.");
+
+    // 1. Construct API Endpoint URL
+    const model_name = "gemini-pro"; // Hardcoded for now
+    const api_url = `https://generativelanguage.googleapis.com/v1beta/models/${model_name}:generateContent?key=${raw_google_api_key}`;
+    // For security, avoid logging the full URL with the key in production.
+    // The debug log will only show the key if debug_mode is on and the log function doesn't redact it.
+    debug(`Google API URL: https://generativelanguage.googleapis.com/v1beta/models/${model_name}:generateContent?key=REDACTED_API_KEY_IN_LOG`);
+
+    // 2. Prepare Prompt
+    const full_prompt = (instructions_from_base_profile ? instructions_from_base_profile + "\n\n" : "") + text_to_summarize;
+    if (get_settings('debug_mode')) { // Only log potentially large prompts if debug mode is on
+        debug("Full prompt for Google API (first 200 chars): " + full_prompt.substring(0, 200));
+    }
+
+    // 3. Construct Request Payload (JSON Body)
+    const payload = {
+        contents: [{
+            parts: [{
+                text: full_prompt
+            }]
+        }]
+    };
+
+    // Generation Config
+    const generationConfig = {};
+    if (generation_params.temperature !== undefined && generation_params.temperature !== null) {
+        generationConfig.temperature = Number(generation_params.temperature);
+    }
+
+    // Max Output Tokens: Consider various names ST might use in presets.
+    // Order of preference: max_new_tokens, genamt, then a fallback default.
+    let maxOutputTokens = 256; // Default
+    if (generation_params.max_new_tokens !== undefined && generation_params.max_new_tokens !== null) {
+        maxOutputTokens = Number(generation_params.max_new_tokens);
+    } else if (generation_params.genamt !== undefined && generation_params.genamt !== null) {
+        maxOutputTokens = Number(generation_params.genamt);
+    }
+    generationConfig.maxOutputTokens = maxOutputTokens;
+
+    // Add other common parameters if they exist and are simple to map
+    if (generation_params.top_p !== undefined && generation_params.top_p !== null) {
+        generationConfig.topP = Number(generation_params.top_p);
+    }
+    if (generation_params.top_k !== undefined && generation_params.top_k !== null) {
+        generationConfig.topK = Number(generation_params.top_k);
+    }
+    // Gemini API doesn't directly support typical_p, repetition_penalty in the same way.
+    // It has stopSequences, but that's more complex than this initial setup.
+
+    if (Object.keys(generationConfig).length > 0) {
+        payload.generationConfig = generationConfig;
+        if (get_settings('debug_mode')) {
+            debug("Generation config for Google API: " + JSON.stringify(generationConfig));
+        }
+    }
+
+    // 4. Make fetch Call
+    try {
+        if (get_settings('debug_mode')) {
+            debug("Sending request to Google API. Payload (first 300 chars): " + JSON.stringify(payload).substring(0, 300) + "...");
+        }
+        const response = await fetch(api_url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        });
+
+        // 5. Handle Response
+        if (!response.ok) {
+            let error_detail = response.statusText;
+            let error_code = response.status;
+            try {
+                const error_data = await response.json();
+                error_detail = error_data?.error?.message || JSON.stringify(error_data?.error); // Gemini often has error.message
+                if(error_data?.error?.code) error_code = error_data.error.code;
+                if (get_settings('debug_mode')) {
+                     debug("Google API Error Data: " + JSON.stringify(error_data));
+                }
+            } catch (e) {
+                // If parsing error JSON fails, stick with statusText
+                if (get_settings('debug_mode')) {
+                    debug("Could not parse JSON error from Google API response: " + e.message);
+                }
+            }
+            const error_message = `Google API Error: ${error_code} - ${error_detail}`;
+            error(error_message); // Log to console via extension's error utility
+            return { success: false, error: error_message };
+        }
+
+        const data = await response.json();
+        if (get_settings('debug_mode')) {
+            debug("Google API Response Data (first 300 chars): " + JSON.stringify(data).substring(0, 300) + "...");
+        }
+
+        // 6. Extract Summary
+        // Gemini's response structure can vary slightly based on whether safety filters blocked parts or the whole thing.
+        // A robust check:
+        let summary_text = "";
+        if (data.candidates && data.candidates.length > 0) {
+            const candidate = data.candidates[0];
+            if (candidate.finishReason === "SAFETY") {
+                 error("Google API summarization failed due to safety settings. Candidate: " + JSON.stringify(candidate));
+                 return { success: false, error: "Content blocked by API safety settings."};
+            }
+            if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
+                summary_text = candidate.content.parts.map(part => part.text).join(""); // Join if multiple parts
+            }
+        }
+
+
+        if (!summary_text) {
+            error("Failed to extract summary text from Google API response. Check logs if debug_mode is on.");
+            if (get_settings('debug_mode')) {
+                debug("Full Google API response for missing summary: " + JSON.stringify(data));
+            }
+            return { success: false, error: "Failed to extract summary from API response (no text found)." };
+        }
+
+        debug("Summary extracted successfully from Google API.");
+        return { success: true, summary: summary_text.trim() };
+
+    } catch (e) {
+        // 7. Catch fetch Errors
+        error("Network or fetch error in summarize_with_google_api: " + e.message);
+        if (get_settings('debug_mode')) {
+            debug("Fetch error stack in summarize_with_google_api: " + e.stack);
+        }
+        return { success: false, error: "Network or fetch error: " + e.message };
+    }
+}
+
 
 // Summarization
 async function summarize_messages(indexes = null, show_progress = true, api_keys = []) {
     // Summarize the given list of message indexes (or a single index)
-    // api_keys is an array of connection profile names to be used in round-robin.
+    // raw_api_keys_list_param is an array of actual API key strings if using direct Google API.
+    // If raw_api_keys_list_param is empty, it falls back to using ST connection profiles (from api_keys_as_profiles_param).
     let ctx = getContext();
 
+    // Parameter renaming for clarity in this refactor:
+    // api_keys (old name) is now effectively raw_api_keys_list_param if direct, or api_keys_as_profiles_param if profile rotation.
+    // For this refactor, we assume `api_keys` parameter holds RAW keys for direct Google API.
+    // The fallback will use the settings-based profile rotation if `api_keys` is empty.
+    const raw_api_keys_list_param = api_keys; // Renaming for clarity within this function's scope.
+
     if (indexes === null) {  // default to the most recent message, min 0
-        indexes = [Math.max(ctx.chat.length - 1, 0)]
+        indexes = [Math.max(ctx.chat.length - 1, 0)];
     }
     indexes = Array.isArray(indexes) ? indexes : [indexes]  // cast to array if only one given
     if (!indexes.length) return;
 
-    debug(`Summarizing ${indexes.length} messages. API keys provided: ${api_keys.length}`)
+    debug(`Summarizing ${indexes.length} messages. Raw Google API Keys provided: ${raw_api_keys_list_param.length}`);
 
     // only show progress if there's more than one message to summarize
     show_progress = show_progress && indexes.length > 1;
@@ -2617,7 +2764,40 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
 
     const initial_connection_profile = await get_current_connection_profile();
     const initial_preset = await get_current_preset();
-    const using_multiple_api_keys = Array.isArray(api_keys) && api_keys.length > 0;
+
+    try {
+        const base_profile_name_from_settings = get_settings('connection_profile');
+    const use_direct_google_api = Array.isArray(raw_api_keys_list_param) && raw_api_keys_list_param.length > 0;
+
+    let instructions_from_base_profile = "";
+    let generation_params_from_base_profile = {};
+
+    if (base_profile_name_from_settings) {
+        try {
+            const preset_obj = getPresetManager().getCompletionPresetByName(base_profile_name_from_settings, await get_connection_profile_api(base_profile_name_from_settings));
+            if (preset_obj) {
+                // Extract instructions: Prioritize system_prompt, then prefix. Concatenate if sensible.
+                // This logic might need refinement based on typical preset structures for instructions.
+                if (preset_obj.system_prompt) instructions_from_base_profile += preset_obj.system_prompt;
+                if (preset_obj.prefix) instructions_from_base_profile = (instructions_from_base_profile ? instructions_from_base_profile + "\n" : "") + preset_obj.prefix;
+
+                // Extract generation parameters
+                const { temperature, max_new_tokens, genamt, top_p, top_k } = preset_obj;
+                if (temperature !== undefined) generation_params_from_base_profile.temperature = temperature;
+                // Prefer max_new_tokens, then genamt for max output tokens
+                if (max_new_tokens !== undefined) generation_params_from_base_profile.max_new_tokens = max_new_tokens;
+                else if (genamt !== undefined) generation_params_from_base_profile.genamt = genamt;
+                if (top_p !== undefined) generation_params_from_base_profile.top_p = top_p;
+                if (top_k !== undefined) generation_params_from_base_profile.top_k = top_k;
+                debug("Extracted from base profile preset: Instr (len): " + instructions_from_base_profile.length + ", Params: " + JSON.stringify(generation_params_from_base_profile));
+            } else {
+                debug(`Base profile "${base_profile_name_from_settings}" preset not found.`);
+            }
+        } catch (ex) {
+            error(`Error extracting settings from base profile "${base_profile_name_from_settings}": ${ex.message}`);
+        }
+    }
+
 
     // Helper function to clear memory fields in case of pre-summary errors
     function clear_memory_on_profile_error(message) {
@@ -2666,27 +2846,172 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
             await set_preset(settings_preset);
         }
     }
-    // If using_multiple_api_keys, profile/preset will be set per message inside the loop.
+    // If using direct Google API, we don't rotate ST profiles. Otherwise, old logic for ST profile rotation applies.
+    // The variable `using_multiple_api_keys` previously referred to rotating ST profiles.
+    // Now, `use_direct_google_api` controls the new path.
+    // The old ST profile rotation logic (using api_keys as profile names) is effectively the fallback if raw_api_keys_list_param is empty.
 
-    let rotation_idx = 0; // Index for API key rotation
     let successfully_summarized_count = 0;
 
-    for (const i of indexes) { // i is the message index from the input array
-        if (show_progress) progress_bar('summarize', successfully_summarized_count + 1, indexes.length, "Summarizing");
+    if (use_direct_google_api) {
+        debug("Using direct Google API calls with raw keys.");
+        const MAX_CONCURRENT_CALLS = Math.min(raw_api_keys_list_param.length, 3); // Limit concurrency
+        let promises = [];
+        let current_raw_key_idx = 0;
 
-        if (STOP_SUMMARIZATION) {
-            log('Summarization stopped');
-            break;
+        for (const message_idx of indexes) {
+            if (STOP_SUMMARIZATION) {
+                log('Summarization stopped before processing message index: ' + message_idx);
+                break;
+            }
+            if (show_progress) progress_bar('summarize', successfully_summarized_count + 1, indexes.length, "Summarizing (Direct API)");
+
+            const text_to_summarize = ctx.chat[message_idx].mes;
+            const raw_google_api_key_to_use = raw_api_keys_list_param[current_raw_key_idx % raw_api_keys_list_param.length];
+            current_raw_key_idx++;
+
+            // Update UI to "Summarizing..." before pushing promise
+            update_message_visuals(message_idx, false, "Summarizing w/ Google API...");
+            if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(message_idx, null, false, "Summarizing w/ Google API...");
+
+
+            promises.push(
+                summarize_with_google_api(text_to_summarize, raw_google_api_key_to_use, instructions_from_base_profile, generation_params_from_base_profile)
+                    .then(result => ({ message_idx, result })) // Package result with original index
+                    .catch(error_obj => ({ message_idx, result: { success: false, error: "Promise rejected: " + error_obj.message } })) // Catch promise rejections
+            );
+
+            if (promises.length >= MAX_CONCURRENT_CALLS || indexes.indexOf(message_idx) === indexes.length - 1) {
+                const settled_results = await Promise.allSettled(promises);
+                promises = []; // Clear for next batch
+
+                for (const item of settled_results) {
+                    if (item.status === 'fulfilled') {
+                        const { message_idx: mi, result } = item.value;
+                        const message_obj = ctx.chat[mi];
+                        if (result.success) {
+                            set_data(message_obj, 'memory', result.summary);
+                            set_data(message_obj, 'error', null);
+                            set_data(message_obj, 'edited', false);
+                            set_data(message_obj, 'prefill', ""); // Assuming direct API doesn't use ST prefill system
+                            set_data(message_obj, 'reasoning', "");// Assuming direct API doesn't use ST reasoning system
+                            successfully_summarized_count++;
+                        } else {
+                            set_data(message_obj, 'error', result.error);
+                            set_data(message_obj, 'memory', null);
+                        }
+                        update_message_visuals(mi, false);
+                        if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(mi, null, false);
+                    } else { // status === 'rejected'
+                        // This case should ideally be caught by the .catch() in the promise chain,
+                        // but as a fallback:
+                        const mi = item.reason?.message_idx || promises.find(p => p.message_idx === item.reason?.message_idx)?.message_idx || -1; // Attempt to find index if possible
+                        error(`Promise rejected for message index ${mi}: ${item.reason}`);
+                        if (mi !== -1) {
+                            set_data(ctx.chat[mi], 'error', "Unhandled summarization error: " + item.reason);
+                            set_data(ctx.chat[mi], 'memory', null);
+                            update_message_visuals(mi, false);
+                            if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(mi, null, false);
+                        }
+                    }
+                }
+            }
+             // Delay logic for direct API calls (if desired, can be less aggressive than profile switching)
+            let time_delay = get_settings('summarization_time_delay');
+            if (time_delay > 0 && indexes.indexOf(message_idx) < indexes.length - 1) {
+                 if (STOP_SUMMARIZATION) break;
+                 debug(`Delaying direct Google API call by ${time_delay} seconds`);
+                 if (show_progress) progress_bar('summarize', null, null, "Delaying Direct API");
+                 await new Promise((resolve) => {
+                    SUMMARIZATION_DELAY_TIMEOUT = setTimeout(resolve, time_delay * 1000);
+                    SUMMARIZATION_DELAY_RESOLVE = resolve;
+                });
+            }
         }
 
-        let current_profile_name_for_message = null;
-        if (using_multiple_api_keys) {
-            current_profile_name_for_message = api_keys[rotation_idx % api_keys.length];
-            debug(`Using profile ${current_profile_name_for_message} for message index ${i} (API key rotation)`);
+    } else { // Fallback to old logic (ST profile-based summarization, potentially with profile rotation if api_keys_as_profiles_param was used)
+        debug("Using fallback ST profile-based summarization.");
+        // This part is the original logic for using ST connection profiles.
+        // The 'api_keys' parameter (now raw_api_keys_list_param) is empty here.
+        // If there was a previous mechanism to use `api_keys` as profile names, that would be a separate path.
+        // For now, this assumes it uses the single 'connection_profile' from settings.
 
-            const is_profile_valid = await verify_connection_profile(current_profile_name_for_message);
-            if (!is_profile_valid) {
-                const err_msg = `Invalid API Key Profile: ${current_profile_name_for_message}`;
+        const using_st_profile_rotation = false; // Set to true if a different param controlled profile rotation.
+                                                // For this refactor, assuming only one settings_connection_profile or direct Google API.
+
+        if (!using_st_profile_rotation) { // Standard fallback: use the single profile from settings
+            const settings_connection_profile = get_settings('connection_profile');
+            const settings_preset = get_settings('completion_preset');
+            if (!await verify_connection_profile(settings_connection_profile)) {
+                error(`Fallback profile "${settings_connection_profile}" from settings is invalid. Aborting all summarizations.`);
+                if (get_settings('block_chat')) ctx.activateSendButtons();
+                if (show_progress) remove_progress_bar('summarize');
+                for (const i_fallback of indexes) {
+                    set_data(ctx.chat[i_fallback], 'error', `Batch summarization aborted due to invalid profile: ${settings_connection_profile}`);
+                    clear_memory_on_profile_error(ctx.chat[i_fallback]);
+                    update_message_visuals(i_fallback, false);
+                    if (memoryEditInterface?.is_open()) memoryEditInterface.update_message_visuals(i_fallback, null, false);
+                }
+                // Restore initial profile BEFORE refresh_memory if it was changed for verification
+                if (await get_current_connection_profile() !== initial_connection_profile) await set_connection_profile(initial_connection_profile);
+                if (await get_current_preset() !== initial_preset) await set_preset(initial_preset);
+                refresh_memory();
+                return;
+            }
+            if (settings_connection_profile !== initial_connection_profile) await set_connection_profile(settings_connection_profile);
+            if (settings_preset !== initial_preset) await set_preset(settings_preset);
+        }
+        // Removed the old ST profile rotation logic for this refactor for clarity, assuming it's one or the other.
+        // If ST profile rotation needs to be re-introduced, it would be a separate conditional block.
+
+        for (const i of indexes) {
+            if (show_progress) progress_bar('summarize', successfully_summarized_count + 1, indexes.length, "Summarizing (ST Profile)");
+            if (STOP_SUMMARIZATION) { log('Summarization stopped'); break; }
+
+            // This is where the old ST profile rotation logic would go if `api_keys_as_profiles_param` was populated.
+            // For now, it uses the single profile set above (settings_connection_profile).
+
+            await summarize_message(i); // This function internally calls summarize_text -> generateRaw
+            const message_error_fallback = get_data(ctx.chat[i], 'error');
+            if (message_error_fallback) {
+                error(`Summarization for message index ${i} failed using ST profile. Error: ${message_error_fallback}`);
+            } else {
+                successfully_summarized_count++;
+            }
+
+            let time_delay = get_settings('summarization_time_delay');
+            if (time_delay > 0 && (indexes.indexOf(i) < indexes.length - 1)) {
+                if (STOP_SUMMARIZATION) { log('Summarization stopped during delay'); break; }
+                debug(`Delaying ST profile summarization by ${time_delay} seconds`);
+                if (show_progress) progress_bar('summarize', null, null, "Delaying ST Profile");
+                await new Promise((resolve) => {
+                    SUMMARIZATION_DELAY_TIMEOUT = setTimeout(resolve, time_delay * 1000);
+                    SUMMARIZATION_DELAY_RESOLVE = resolve;
+                });
+            }
+        }
+    }
+
+
+    // Restore initial connection profile and preset
+    if (await get_current_connection_profile() !== initial_connection_profile) {
+        await set_connection_profile(initial_connection_profile);
+    }
+    if (await get_current_preset() !== initial_preset) {
+        await set_preset(initial_preset);
+    }
+
+    // remove the progress bar
+    if (show_progress) remove_progress_bar('summarize');
+
+    if (STOP_SUMMARIZATION) {
+        STOP_SUMMARIZATION = false;
+        log('Summarization process was stopped by user.');
+    } else {
+        debug(`Successfully summarized messages: ${successfully_summarized_count} out of ${indexes.length} attempted.`);
+    }
+
+    if (get_settings('block_chat')) {
                 error(`${err_msg} for message index ${i}`);
                 set_data(ctx.chat[i], 'error', err_msg);
                 clear_memory_on_profile_error(ctx.chat[i]);
@@ -2773,6 +3098,17 @@ async function summarize_messages(indexes = null, show_progress = true, api_keys
     // Update the memory state interface if it's open
     if (memoryEditInterface?.is_open()) { // Check if interface exists and is open
         memoryEditInterface.update_table();
+    }
+} finally {
+        // Ensure ST state is restored even if errors occur above.
+        if (await get_current_connection_profile() !== initial_connection_profile) {
+            debug("Restoring initial connection profile due to error or completion.");
+            await set_connection_profile(initial_connection_profile);
+        }
+        if (await get_current_preset() !== initial_preset) {
+            debug("Restoring initial preset due to error or completion.");
+            await set_preset(initial_preset);
+        }
     }
 }
 async function summarize_message(index) {
@@ -3432,7 +3768,17 @@ Available Macros:
     bind_setting('#default_chat_enabled', 'default_chat_enabled', 'boolean');
     bind_setting('#use_global_toggle_state', 'use_global_toggle_state', 'boolean');
 
-    bind_setting('#api_keys_input', 'api_keys_list', 'text');
+    // Custom binding for API keys list (textarea to array)
+    const apiKeysInputDebouncedSave = debounce(() => {
+        const keysText = $(`.${settings_content_class} #api_keys_input`).val();
+        const keysArray = keysText ? keysText.split('\n').map(key => key.trim()).filter(key => key.length > 0) : [];
+        set_settings('api_keys_list', keysArray);
+        // refresh_settings(); // set_settings already calls this
+        // refresh_memory_debounced(); // set_settings already calls this
+    }, debounce_timeout.medium);
+
+    $(`.${settings_content_class} #api_keys_input`).on('input change', apiKeysInputDebouncedSave);
+
 
     // trigger the change event once to update the display at start
     $('#long_term_context_limit').trigger('change');

@@ -61,8 +61,8 @@
 
                 <table>
 
-                    <tr title="The connection profile to use for summaries. Note that choosing a different profile will require temporarily switching to the profile during summarization, discarding any unsaved changes to the current profile.">
-                        <td><span>Connection Profile</span></td>
+                    <tr title="Select the base SillyTavern Connection Profile for Google API. This profile's instructions and model settings will be used. The actual API key will be overridden by the keys below.">
+                        <td><span>Base Connection Profile</span></td>
                         <td><select id="connection_profile" class="text_pole"></select></td>
                     </tr>
 
@@ -87,8 +87,8 @@
 
                 <!-- API Key Management -->
                 <h4 class="textAlignCenter">API Key Management <i class="fa-solid fa-info-circle" title="Manage API keys for external services."></i></h4>
-                <label for="api_keys_input">Paste your API keys below, one per line:</label>
-                <textarea id="api_keys_input" class="text_pole" rows="4" placeholder="Enter API keys here..."></textarea>
+                <label for="api_keys_input">Enter raw Google API keys below, one per line. These will override the API key of the selected base Google profile above and be rotated:</label>
+                <textarea id="api_keys_input" class="text_pole" rows="4" placeholder="Enter raw Google API keys here, one per line..." title="Enter raw Google API keys, one per line. These will override the API key of the selected base Google profile above, and be rotated for each summarization."></textarea>
 
                 <hr>
 
